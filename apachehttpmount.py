@@ -3,132 +3,295 @@
 from __future__ import with_statement
 
 import os
+import re
+import pwd
 import sys
+import stat
 import errno
+import datetime
+import collections
 
 from fuse import FUSE, FuseOSError, Operations
+import requests
 
 
-class Passthrough(Operations):
+DEBUG = 0
+
+
+LISTING = b'''<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 3.2 Final//EN">
+<html>
+ <head>
+  <title>Index of '''
+
+
+class Http(Operations):
     def __init__(self, root):
+        assert root.startswith('http')
         self.root = root
+        self._cache = {}
+        nobody = pwd.getpwnam('nobody')
+        self.uid = nobody.pw_uid
+        self.gid = nobody.pw_gid
 
     # Helpers
     # =======
 
     def _full_path(self, partial):
-        if partial.startswith("/"):
-            partial = partial[1:]
-        path = os.path.join(self.root, partial)
+        path = os.path.join(self.root, partial.lstrip('/'))
         return path
+
+    def _get(self, path):
+        try:
+            result = self._cache[path]
+        except KeyError:
+            pass
+        else:
+            if result is None:
+                raise FileNotFoundError(path)
+            if DEBUG: print(path, "Cached", len(result))
+            return result
+        full_path = self._full_path(path)
+        print('GET ' + full_path)
+        response = requests.get(full_path)
+        if response.status_code == 404:
+            self._cache[path] = None
+            raise FileNotFoundError(path)
+        elif response.status_code != 200:
+            print("Response code %s" % response.status_code)
+            raise FuseOSError(errno.EIO)
+        if response.content.startswith(LISTING):
+            self._cache[path] = self._parse_listing(response.text)
+            if DEBUG: print(path, "Entries %s" % len(self._cache[path]))
+        else:
+            self._cache[path] = response.content
+            if DEBUG: print(path, "Size %s" % len(response.content))
+            pardir = self._get(os.path.dirname(path))
+            basename = os.path.basename(path)
+            icon, size_, mtime_dt = pardir[basename]
+            pardir[basename] = icon, len(response.content), mtime_dt
+        return self._cache[path]
+
+    def _parse_listing(self, text):
+        start = '<pre>'
+        end = '</pre>'
+        assert text.count(start) == text.count(end) == 1
+        listing = text[text.index(start)+len(start):text.index(end)]
+        lines = listing.splitlines()
+        header = lines[0]
+        assert header.count('Name') == header.count('Last modified') == 1
+        entries = lines[1:-1]
+        assert lines[-1] == '<hr>'
+        result = collections.OrderedDict()
+        for str_entry in entries:
+            pattern = (r'^<img src="[^"]+" alt="\[(?P<icon>[^"]+)\]"> ' +
+                       r'<a href="(?P<url>[^"]+)">(?P<name>[^<]+)</a>\s*' +
+                       r'(?P<date>\d+-\w+-\d+)\s+(?P<time>\d+:\d+)\s+' +
+                       r'(?P<size>[0-9.]+|-)(?P<sizeunit>\w?)\s*$')
+            mo = re.match(pattern, str_entry)
+            assert mo, str_entry
+            icon, url, name = mo.group('icon', 'url', 'name')
+            assert url == name, (url, name)
+            isdir = name.endswith('/')
+            name = name.rstrip('/')
+            assert isdir == (icon == 'DIR')
+            str_date, str_time = mo.group('date', 'time')
+            mtime = datetime.datetime.strptime(
+                ' '.join((str_date, str_time)),
+                '%d-%b-%Y %H:%M')
+            str_size, str_sizeunit = mo.group('size', 'sizeunit')
+            sizes = [''] + list('KMGTP')
+            size = (0 if str_size == '-' else
+                    int((0.1 + float(str_size)) * 2 ** (10*sizes.index(str_sizeunit))))
+
+            result[name] = (icon, size, mtime)
+        return result
+
+    def _getdent(self, path):
+        if path == '/':
+            return ('DIR', 0, datetime.datetime.fromtimestamp(0))
+        dirname = os.path.dirname(path)
+        if DEBUG: print("Get dent", path, dirname)
+        try:
+            dir = self._get(dirname)
+        except FileNotFoundError:
+            raise FuseOSError(errno.ENOENT)
+        if not isinstance(dir, collections.OrderedDict):
+            raise FuseOSError(errno.ENOENT)
+        try:
+            return dir[os.path.basename(path)]
+        except KeyError:
+            raise FileNotFoundError(path) from None
 
     # Filesystem methods
     # ==================
 
+    def trace(fn):
+        def wrapped(self, path, *args):
+            res = '???'
+            try:
+                result = fn(self, path, *args)
+            except FuseOSError as exn:
+                res = '%s' % (errno.errorcode[exn.args[0]],)
+                raise
+            except Exception as exn:
+                res = repr(exn)
+                raise
+            else:
+                res = 'OK'
+            finally:
+                if DEBUG: print("%s(%s) -> %s" % (fn.__name__, path, res))
+            return result
+        return wrapped
+
+    @trace
     def access(self, path, mode):
-        full_path = self._full_path(path)
-        if not os.access(full_path, mode):
+        if DEBUG: print(path, oct(mode))
+        if mode & os.W_OK:
+            raise FuseOSError(errno.EROFS)
+        try:
+            icon, size, mtime_dt = self._getdent(path)
+        except FileNotFoundError:
+            raise FuseOSError(errno.ENOENT)
+        if mode & os.X_OK and icon != 'DIR':
             raise FuseOSError(errno.EACCES)
 
+    @trace
     def chmod(self, path, mode):
-        full_path = self._full_path(path)
-        return os.chmod(full_path, mode)
+        raise FuseOSError(errno.EROFS)
 
+    @trace
     def chown(self, path, uid, gid):
-        full_path = self._full_path(path)
-        return os.chown(full_path, uid, gid)
+        raise FuseOSError(errno.EROFS)
 
+    @trace
     def getattr(self, path, fh=None):
-        full_path = self._full_path(path)
-        st = os.lstat(full_path)
-        return dict((key, getattr(st, key)) for key in ('st_atime', 'st_ctime',
-                     'st_gid', 'st_mode', 'st_mtime', 'st_nlink', 'st_size', 'st_uid'))
-
-    def readdir(self, path, fh):
-        full_path = self._full_path(path)
-
-        dirents = ['.', '..']
-        if os.path.isdir(full_path):
-            dirents.extend(os.listdir(full_path))
-        for r in dirents:
-            yield r
-
-    def readlink(self, path):
-        pathname = os.readlink(self._full_path(path))
-        if pathname.startswith("/"):
-            # Path name is absolute, sanitize it.
-            return os.path.relpath(pathname, self.root)
+        try:
+            icon, size, mtime_dt = self._getdent(path)
+        except FileNotFoundError:
+            raise FuseOSError(errno.ENOENT)
+        mtime = mtime_dt.timestamp()
+        mode = 0o555 if icon == 'DIR' else 0o444
+        if icon == 'DIR':
+            mode |= stat.S_IFDIR
         else:
-            return pathname
+            mode |= stat.S_IFREG
+        return {
+            'st_atime': mtime,
+            'st_ctime': mtime,
+            'st_gid': self.gid,
+            'st_mode': mode,
+            'st_mtime': mtime,
+            'st_nlink': 1 + (icon == 'DIR'),
+            'st_size': size,
+            'st_uid': self.uid,
+        }
 
+    @trace
+    def readdir(self, path, fh):
+        entry = self._get(path)
+        if not isinstance(entry, collections.OrderedDict):
+            raise FuseOSError(errno.ENOTDIR)
+        dirents = ['.', '..'] + list(entry.keys())
+        return dirents
+
+    @trace
+    def readlink(self, path):
+        raise NotImplementedError
+
+    @trace
     def mknod(self, path, mode, dev):
-        return os.mknod(self._full_path(path), mode, dev)
+        raise FuseOSError(errno.EPERM)
 
+    @trace
     def rmdir(self, path):
-        full_path = self._full_path(path)
-        return os.rmdir(full_path)
+        raise FuseOSError(errno.EROFS)
 
+    @trace
     def mkdir(self, path, mode):
-        return os.mkdir(self._full_path(path), mode)
+        raise FuseOSError(errno.EROFS)
 
+    @trace
     def statfs(self, path):
-        full_path = self._full_path(path)
-        stv = os.statvfs(full_path)
-        return dict((key, getattr(stv, key)) for key in ('f_bavail', 'f_bfree',
-            'f_blocks', 'f_bsize', 'f_favail', 'f_ffree', 'f_files', 'f_flag',
-            'f_frsize', 'f_namemax'))
+        return dict(f_bsize=4096, f_frsize=4096, f_blocks=4114392,
+                    f_bfree=4114392, f_bavail=4114392, f_files=4114392,
+                    f_ffree=4113860, f_favail=4113860, f_flag=4098,
+                    f_namemax=255)
 
+    @trace
     def unlink(self, path):
-        return os.unlink(self._full_path(path))
+        raise FuseOSError(errno.EROFS)
 
+    @trace
     def symlink(self, name, target):
-        return os.symlink(name, self._full_path(target))
+        raise FuseOSError(errno.EROFS)
 
+    @trace
     def rename(self, old, new):
-        return os.rename(self._full_path(old), self._full_path(new))
+        raise FuseOSError(errno.EROFS)
 
+    @trace
     def link(self, target, name):
-        return os.link(self._full_path(target), self._full_path(name))
+        raise FuseOSError(errno.EROFS)
 
+    @trace
     def utimens(self, path, times=None):
-        return os.utime(self._full_path(path), times)
+        raise FuseOSError(errno.EROFS)
 
     # File methods
     # ============
 
+    @trace
     def open(self, path, flags):
-        full_path = self._full_path(path)
-        return os.open(full_path, flags)
+        O_LARGEFILE = 0o100000
+        flags &= ~O_LARGEFILE
+        if flags != os.O_RDONLY:
+            if DEBUG: print(oct(flags))
+            raise FuseOSError(errno.EROFS)
+        try:
+            result = self._get(path)
+        except FileNotFoundError:
+            raise FuseOSError(errno.ENOENT)
+        if isinstance(result, collections.OrderedDict):
+            raise FuseOSError(errno.EISDIR)
+        self.fd += 1
+        return self.fd
 
+    fd = 0
+
+    @trace
     def create(self, path, mode, fi=None):
-        full_path = self._full_path(path)
-        return os.open(full_path, os.O_WRONLY | os.O_CREAT, mode)
+        raise FuseOSError(errno.EROFS)
 
+    @trace
     def read(self, path, length, offset, fh):
-        os.lseek(fh, offset, os.SEEK_SET)
-        return os.read(fh, length)
+        if DEBUG: print(path, length, offset)
+        result = self._get(path)
+        return result[offset:offset+length]
 
+    @trace
     def write(self, path, buf, offset, fh):
-        os.lseek(fh, offset, os.SEEK_SET)
-        return os.write(fh, buf)
+        raise FuseOSError(errno.EROFS)
 
+    @trace
     def truncate(self, path, length, fh=None):
-        full_path = self._full_path(path)
-        with open(full_path, 'r+') as f:
-            f.truncate(length)
+        raise FuseOSError(errno.EROFS)
 
+    @trace
     def flush(self, path, fh):
-        return os.fsync(fh)
+        pass
 
+    @trace
     def release(self, path, fh):
-        return os.close(fh)
+        pass
 
+    @trace
     def fsync(self, path, fdatasync, fh):
-        return self.flush(path, fh)
+        pass
 
 
 def main(mountpoint, root):
-    FUSE(Passthrough(root), mountpoint, nothreads=True, foreground=True)
+    FUSE(Http(root), mountpoint, nothreads=True, foreground=True)
+
 
 if __name__ == '__main__':
-    main(sys.argv[2], sys.argv[1])
+    main(sys.argv[1], sys.argv[2])
